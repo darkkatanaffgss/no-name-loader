@@ -1,0 +1,58 @@
+{
+  "name": "no-name-loader",
+  "version": "1.0.0",
+  "description": "Open-source glassmorphic loader UI, License API & SDK template built with Electron.",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "server": "node api-server/server.js",
+    "build": "node scripts/build.js"
+  },
+  "build": {
+    "appId": "com.noname.loader",
+    "productName": "no name",
+    "asar": true,
+    "afterPack": "scripts/afterPack.js",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "main.js",
+      "preload.js",
+      "index.html",
+      "styles.css",
+      "renderer.js",
+      "sdk/**/*",
+      "assets/**/*"
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "portable",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "icon": "assets/icon.ico",
+      "signExecutable": false
+    },
+    "portable": {
+      "artifactName": "no name.exe"
+    }
+  },
+  "keywords": [
+    "electron",
+    "ui",
+    "loader",
+    "license-api",
+    "glassmorphism"
+  ],
+  "license": "MIT",
+  "devDependencies": {
+    "@electron/packager": "^18.4.0",
+    "electron": "^33.0.0",
+    "electron-builder": "^25.1.8",
+    "rcedit": "^5.0.2"
+  }
+}

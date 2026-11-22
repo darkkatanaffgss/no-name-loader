@@ -1,0 +1,36 @@
+{
+  "licenses": {
+    "NN-DEMO-2026-OPEN": {
+      "username": "Developer",
+      "tier": "Enterprise",
+      "expiresAt": "2035-05-09T03:00:00.000Z",
+      "hwid": null,
+      "revoked": false,
+      "products": [
+        "cs2",
+        "csgo",
+        "minecraft"
+      ],
+      "branches": [
+        "Stable",
+        "Beta",
+        "Nightly"
+      ]
+    },
+    "NN-PRO-30D-8492": {
+      "username": "User",
+      "tier": "Pro",
+      "expiresAt": "2027-01-15T12:00:00.000Z",
+      "hwid": null,
+      "revoked": false,
+      "products": [
+        "cs2",
+        "minecraft"
+      ],
+      "branches": [
+        "Stable",
+        "Beta"
+      ]
+    }
+  }
+}
