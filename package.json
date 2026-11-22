@@ -11,6 +11,7 @@
   "build": {
     "appId": "com.noname.loader",
     "productName": "no name",
+    "electronVersion": "33.4.11",
     "asar": true,
     "afterPack": "scripts/afterPack.js",
     "directories": {
@@ -22,6 +23,7 @@
       "index.html",
       "styles.css",
       "renderer.js",
+      "integrity.json",
       "sdk/**/*",
       "assets/**/*"
     ],
@@ -52,7 +54,8 @@
   "devDependencies": {
     "@electron/packager": "^18.4.0",
     "electron": "^33.0.0",
-    "electron-builder": "^25.1.8",
+    "electron-builder": "^26.18.0",
+    "javascript-obfuscator": "^5.10.1",
     "rcedit": "^5.0.2"
   }
 }

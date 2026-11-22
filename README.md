@@ -4,7 +4,7 @@
   <h1>no name — Glassmorphic Loader & License API</h1>
 
   <p>
-    <strong>Open-Source десктопный лоадер на Electron с матовым сайдбаром, заблюренными баннерами, проверкой подписок по HWID и сборкой в один <code>.exe</code></strong>
+    <strong>Open-Source десктопный лоадер на Electron с матовым сайдбаром, заблюренными баннерами, проверкой подписок по HWID и сборкой в единый <code>.exe</code></strong>
   </p>
 
   <p>
@@ -22,9 +22,9 @@
 
 <br />
 
-## ✨ Возможности интерфейса
+## Особенности интерфейса
 
-- **Выверенный минимализм (`684×460`):** фиксированное окно без растягивания за углы, ровные `20px` скругления без рамок Windows DWM, скрытые скроллбары и плавные `cubic-bezier` анимации.
+- **Компактное окно (`684×460`):** фиксированный размер без растягивания за углы, ровные `20px` скругления без рамок Windows DWM, скрытые скроллбары и плавные `cubic-bezier` анимации.
 - **Тёмный матовый сайдбар + обсидиановый контент:** настраиваемая глубина размытия (`blur`) и затемнения боковой панели в реальном времени прямо в профиле пользователя.
 - **Профили программ с баннерами:** готовые карточки для **Counter-Strike 2**, **Counter-Strike: Global Offensive** и **Minecraft** с размытыми баннерами, историей обновлений и переключением веток (`Nightly` / `Beta` / `Stable`).
 - **Полноэкранный Launch Overlay:** при нажатии на **Launch** всё окно плавно размывается и отображает иконку игры, название и прогресс-бар подготовки профиля.
@@ -32,7 +32,7 @@
 
 ---
 
-## 🖼️ 3D Галерея экранов
+## 3D Галерея экранов
 
 <table>
   <tr>
@@ -51,19 +51,19 @@
 
 ---
 
-## 🔐 License API, SDK и базовая защита
+## Защита лоадера, пользователей и License API
 
-| Компонент | Описание |
+| Уровень защиты | Реализация |
 |---|---|
 | **HWID Binding** | При первой активации ключ привязывается к SHA-256 отпечатку устройства (`hostname`, `arch`, `CPU`, `MAC`). |
-| **HMAC-SHA256 подписи** | Сервер подписывает каждый ответ сессии секретным ключом; `main.js` проверяет подпись через `crypto.timingSafeEqual`. |
-| **Права доступа (Entitlements)** | Разделение доступа по конкретным играм (`products`) и веткам (`Stable`, `Beta`, `Nightly`), проверка срока действия (`expiresAt`). |
-| **Изоляция Electron** | `contextIsolation: true`, `nodeIntegration: false`, `sandbox: true`, запрет дубликатов (`requestSingleInstanceLock`), блокировка DevTools (`F12`, `Ctrl+Shift+I`) и контекстного меню в релизе. |
-| **Single-File Portable EXE** | Сборка упаковывает исходники в `ASAR`-архив и собирает **единый `no name.exe`** со встроенной иконкой **NN** без лишних `.dll` рядом. |
+| **HMAC-SHA256 + Anti-Replay** | Сервер подписывает ответ; `main.js` проверяет подпись через `crypto.timingSafeEqual`, а сервер и клиент отклоняют устаревшие `issuedAt` и повторные `nonce`. |
+| **Rate Limiting (Anti-Bruteforce)** | Встроенный ограничитель запросов по IP на `api-server/server.js` (защита от перебора ключей). |
+| **Sandboxed Renderer + CSP** | Глобальный `app.enableSandbox()`, `contextIsolation: true`, `nodeIntegration: false`, строгий `Content-Security-Policy` в `index.html`, запрет всплывающих окон, навигации и системных разрешений. |
+| **ASAR + SHA-256 Integrity + Obfuscation** | Сборка через `scripts/build.js` обфусцирует JS-файлы (`javascript-obfuscator`), генерирует `integrity.json` с SHA-256 хешами, проверяемыми при запуске, и отключает DevTools (`F12`, `Ctrl+Shift+I`) в релизе. |
 
 ---
 
-## 🚀 Быстрый старт
+## Быстрый старт
 
 ```bash
 # 1. Установка зависимостей
@@ -75,9 +75,11 @@ npm run server
 # 3. Запуск лоадера (в отдельном окне терминала)
 npm start
 
-# 4. Сборка в один файл release/no name.exe
+# 4. Сборка защищённого единого release/no name.exe
 npm run build
 ```
+
+Для быстрого запуска на Windows также доступны скрипты `start-server.bat`, `start-loader.bat` и `build-exe.bat`.
 
 > **Демо-ключи для проверки (`api-server/licenses.json`):**
 > - `NN-DEMO-2026-OPEN` — полный доступ (работает с сервером и в offline-demo режиме).
@@ -85,7 +87,7 @@ npm run build
 
 ---
 
-## 🛠️ API & SDK для разработчиков
+## API и SDK для разработчиков
 
 <details>
 <summary><b>Эндпоинты License API (api-server/server.js)</b></summary>
@@ -139,11 +141,11 @@ async function executeLaunchHook({ productId, branch, session }) {
 
 ---
 
-## 📁 Структура репозитория
+## Структура репозитория
 
 ```text
 ├── api-server/
-│   ├── server.js          # Open-Source сервер проверки лицензий и HWID
+│   ├── server.js          # Защищённый сервер проверки лицензий, Rate-Limit и HWID
 │   └── licenses.json      # Хранилище ключей и подписок
 ├── assets/
 │   ├── icon.ico / .png    # Иконка приложения NN
@@ -155,11 +157,14 @@ async function executeLaunchHook({ productId, branch, session }) {
 ├── sdk/
 │   └── loader-sdk.js      # Конфигурация продуктов и хук запуска
 ├── scripts/
-│   ├── build.js           # Сборщик в единый portable .exe
+│   ├── build.js           # Сборщик (obfuscation + SHA-256 manifest + single EXE)
 │   └── afterPack.js       # Вшивка иконки и метаданных через rcedit
-├── main.js                # Основной процесс Electron + защита
+├── start-server.bat       # Быстрый запуск сервера лицензий
+├── start-loader.bat       # Быстрый запуск клиента
+├── build-exe.bat          # Сборка релизного .exe
+├── main.js                # Основной процесс Electron + Sandbox + Integrity Check
 ├── preload.js             # Безопасный IPC-мост
-├── index.html             # Разметка интерфейса
+├── index.html             # Разметка интерфейса + CSP
 ├── styles.css             # Стили, блюр и анимации
 └── renderer.js            # Логика UI
 ```

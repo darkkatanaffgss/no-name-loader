@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain, shell } = require('electron');
+const { app, BrowserWindow, ipcMain, shell, session } = require('electron');
 const path = require('path');
 const os = require('os');
 const fs = require('fs');
@@ -6,6 +6,9 @@ const http = require('http');
 const https = require('https');
 const crypto = require('crypto');
 const { SDK_CONFIG, executeLaunchHook } = require('./sdk/loader-sdk');
+
+// Enable Chromium OS sandbox globally
+app.enableSandbox();
 
 const gotLock = app.requestSingleInstanceLock();
 if (!gotLock) {
@@ -45,12 +48,28 @@ function verifyApiSignature(payload, signature) {
   return crypto.timingSafeEqual(a, b);
 }
 
+// Verify file existence and SHA-256 integrity manifest when packaged
 function verifyAppIntegrity() {
-  const criticalFiles = ['index.html', 'styles.css', 'renderer.js', 'preload.js'];
+  const criticalFiles = ['index.html', 'styles.css', 'renderer.js', 'preload.js', 'sdk/loader-sdk.js'];
   for (const file of criticalFiles) {
     const p = path.join(__dirname, file);
     if (!fs.existsSync(p)) {
       throw new Error(`Integrity check failed: missing ${file}`);
+    }
+  }
+
+  const manifestPath = path.join(__dirname, 'integrity.json');
+  if (app.isPackaged && fs.existsSync(manifestPath)) {
+    const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+    for (const [relPath, expectedHash] of Object.entries(manifest)) {
+      const target = path.join(__dirname, relPath);
+      if (!fs.existsSync(target)) {
+        throw new Error(`Integrity check failed: missing ${relPath}`);
+      }
+      const actualHash = crypto.createHash('sha256').update(fs.readFileSync(target)).digest('hex');
+      if (actualHash !== expectedHash) {
+        throw new Error(`Integrity check failed: modified ${relPath}`);
+      }
     }
   }
 }
@@ -79,7 +98,7 @@ function postJson(targetUrl, bodyObj) {
         res.on('end', () => {
           try {
             resolve({ status: res.statusCode, data: JSON.parse(raw) });
-          } catch (err) {
+          } catch (_) {
             reject(new Error('Invalid JSON response from License API'));
           }
         });
@@ -98,8 +117,11 @@ function postJson(targetUrl, bodyObj) {
 function createWindow() {
   verifyAppIntegrity();
 
-  // Exact 684x460 transparent frameless window with thickFrame: false & hasShadow: false
-  // so CSS border-radius: 20px cuts cleanly to alpha=0 with zero outer shadow clipping box.
+  // Deny all browser permission requests (camera, mic, geolocation, notifications)
+  session.defaultSession.setPermissionRequestHandler((_wc, _permission, callback) => {
+    callback(false);
+  });
+
   mainWindow = new BrowserWindow({
     width: 684,
     height: 460,
@@ -119,6 +141,12 @@ function createWindow() {
       sandbox: true,
       devTools: !app.isPackaged
     }
+  });
+
+  // Block popup windows and unexpected navigations
+  mainWindow.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
+  mainWindow.webContents.on('will-navigate', (event) => {
+    event.preventDefault();
   });
 
   mainWindow.webContents.on('before-input-event', (event, input) => {
@@ -199,6 +227,9 @@ ipcMain.handle('auth:verify-key', async (_event, keyInput) => {
     }
     if (payload.nonce !== nonce || payload.hwid !== hwid) {
       return { ok: false, error: 'Session mismatch detected' };
+    }
+    if (Math.abs(Date.now() - Number(payload.issuedAt || 0)) > 60000) {
+      return { ok: false, error: 'Stale license response rejected' };
     }
 
     activeSession = { ...payload, key: cleanKey, mode: 'online' };

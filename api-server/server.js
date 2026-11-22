@@ -8,6 +8,39 @@ const API_SECRET = process.env.API_SECRET || 'noname-opensource-hmac-secret-chan
 const ADMIN_SECRET = process.env.ADMIN_SECRET || 'noname-admin-secret-change-me';
 const DB_PATH = path.join(__dirname, 'licenses.json');
 
+// Sliding-window per-IP rate limiter & nonce replay cache
+const RATE_WINDOW_MS = 60_000;
+const RATE_MAX_REQUESTS = 20;
+const NONCE_TTL_MS = 120_000;
+
+const rateBuckets = new Map();
+const seenNonces = new Map();
+
+function isRateLimited(ip) {
+  const now = Date.now();
+  const bucket = (rateBuckets.get(ip) || []).filter((ts) => now - ts < RATE_WINDOW_MS);
+  bucket.push(now);
+  rateBuckets.set(ip, bucket);
+  return bucket.length > RATE_MAX_REQUESTS;
+}
+
+function checkAndStoreNonce(nonce) {
+  const now = Date.now();
+  for (const [k, exp] of seenNonces.entries()) {
+    if (exp < now) seenNonces.delete(k);
+  }
+  if (seenNonces.has(nonce)) return false;
+  seenNonces.set(nonce, now + NONCE_TTL_MS);
+  return true;
+}
+
+function timingSafeMatch(input, expected) {
+  const a = Buffer.from(String(input || ''), 'utf8');
+  const b = Buffer.from(String(expected || ''), 'utf8');
+  if (a.length !== b.length || a.length === 0) return false;
+  return crypto.timingSafeEqual(a, b);
+}
+
 function loadDb() {
   try {
     return JSON.parse(fs.readFileSync(DB_PATH, 'utf8'));
@@ -30,7 +63,9 @@ function sendJson(res, statusCode, body) {
   res.writeHead(statusCode, {
     'Content-Type': 'application/json; charset=utf-8',
     'Content-Length': Buffer.byteLength(json),
-    'Cache-Control': 'no-store'
+    'Cache-Control': 'no-store',
+    'X-Content-Type-Options': 'nosniff',
+    'X-Frame-Options': 'DENY'
   });
   res.end(json);
 }
@@ -57,6 +92,11 @@ function readBody(req) {
 }
 
 const server = http.createServer(async (req, res) => {
+  const clientIp = req.socket.remoteAddress || 'unknown';
+  if (isRateLimited(clientIp)) {
+    return sendJson(res, 429, { valid: false, error: 'Too many requests. Please wait a minute.' });
+  }
+
   const url = new URL(req.url, `http://127.0.0.1:${PORT}`);
 
   if (req.method === 'GET' && url.pathname === '/api/v1/health') {
@@ -68,6 +108,9 @@ const server = http.createServer(async (req, res) => {
       const { key, hwid, nonce } = await readBody(req);
       if (!key || !hwid || !nonce) {
         return sendJson(res, 400, { valid: false, error: 'Missing key, hwid, or nonce' });
+      }
+      if (!checkAndStoreNonce(String(nonce))) {
+        return sendJson(res, 403, { valid: false, error: 'Replay attempt detected (duplicate nonce)' });
       }
 
       const cleanKey = String(key).trim().toUpperCase();
@@ -86,7 +129,6 @@ const server = http.createServer(async (req, res) => {
         return sendJson(res, 403, { valid: false, error: 'Subscription expired' });
       }
 
-      // Bind HWID on first activation, enforce match on subsequent checks
       if (!record.hwid) {
         record.hwid = String(hwid);
         saveDb(db);
@@ -108,14 +150,13 @@ const server = http.createServer(async (req, res) => {
 
       const signature = signPayload(payload);
       return sendJson(res, 200, { payload, signature });
-    } catch (err) {
+    } catch (_) {
       return sendJson(res, 400, { valid: false, error: 'Invalid request body' });
     }
   }
 
   if (req.method === 'POST' && url.pathname === '/api/v1/admin/keys') {
-    const adminHeader = req.headers['x-admin-secret'];
-    if (adminHeader !== ADMIN_SECRET) {
+    if (!timingSafeMatch(req.headers['x-admin-secret'], ADMIN_SECRET)) {
       return sendJson(res, 403, { ok: false, error: 'Unauthorized' });
     }
 
