@@ -33,6 +33,9 @@ loadEnvFile(ENV_PATH);
 const PORT = Number(process.env.PORT || 3840);
 const ADMIN_SECRET = process.env.ADMIN_SECRET;
 const PRIVATE_KEY_B64 = process.env.ED25519_PRIVATE_KEY;
+const ALLOWED_ADMIN_IPS = new Set(
+  (process.env.ADMIN_ALLOWED_IPS || '127.0.0.1,::1').split(',').map((s) => s.trim()).filter(Boolean)
+);
 
 if (!ADMIN_SECRET || !PRIVATE_KEY_B64) {
   console.error('[Server] Fatal: ADMIN_SECRET or ED25519_PRIVATE_KEY missing in api-server/.env.');
@@ -40,21 +43,28 @@ if (!ADMIN_SECRET || !PRIVATE_KEY_B64) {
 }
 
 const PRIVATE_KEY_PEM = Buffer.from(PRIVATE_KEY_B64, 'base64').toString('utf8');
-// Pre-hash ADMIN_SECRET with SHA-512 so comparison always operates on fixed 64-byte digests
-const ADMIN_DIGEST = crypto.createHash('sha512').update(ADMIN_SECRET, 'utf8').digest();
+const ADMIN_DIGEST_HEX = crypto.createHash('sha512').update(ADMIN_SECRET, 'utf8').digest('hex');
 
-// Rate limiter, nonce replay cache, admin brute-force lockout & ephemeral admin sessions
+// Rate limits, nonce replay cache, admin challenge-response & session stores
 const RATE_WINDOW_MS = 60_000;
-const RATE_MAX_REQUESTS = 35;
+const RATE_MAX_REQUESTS = 45;
 const NONCE_TTL_MS = 120_000;
+const CHALLENGE_TTL_MS = 30_000;
 const ADMIN_FAIL_LIMIT = 5;
 const ADMIN_LOCK_MS = 15 * 60_000;
 const ADMIN_SESSION_TTL_MS = 30 * 60_000;
+const ADMIN_IDLE_TTL_MS = 10 * 60_000;
 
 const rateBuckets = new Map();
 const seenNonces = new Map();
-const adminFailures = new Map(); // ip -> { count, lockedUntil }
-const adminSessions = new Map(); // token -> { ip, uaHash, expiresAt }
+const adminChallenges = new Map(); // challenge -> { ip, expiresAt }
+const adminFailures = new Map();   // ip -> { count, lockedUntil }
+const adminSessions = new Map();   // token -> { ip, uaHash, csrfToken, expiresAt, lastActiveAt }
+
+function normalizeIp(rawIp) {
+  const s = String(rawIp || 'unknown');
+  return s.startsWith('::ffff:') ? s.slice(7) : s;
+}
 
 function isRateLimited(ip) {
   const now = Date.now();
@@ -74,20 +84,16 @@ function checkAndStoreNonce(nonce) {
   return true;
 }
 
-function verifyAdminSecret(inputSecret) {
-  const inputDigest = crypto.createHash('sha512').update(String(inputSecret || ''), 'utf8').digest();
-  return crypto.timingSafeEqual(inputDigest, ADMIN_DIGEST);
+function isAdminIpAllowed(ip) {
+  if (ALLOWED_ADMIN_IPS.has('*')) return true;
+  return ALLOWED_ADMIN_IPS.has(ip);
 }
 
 function isAdminIpLocked(ip) {
   const entry = adminFailures.get(ip);
   if (!entry) return false;
-  if (entry.lockedUntil && Date.now() < entry.lockedUntil) {
-    return true;
-  }
-  if (entry.lockedUntil && Date.now() >= entry.lockedUntil) {
-    adminFailures.delete(ip);
-  }
+  if (entry.lockedUntil && Date.now() < entry.lockedUntil) return true;
+  if (entry.lockedUntil && Date.now() >= entry.lockedUntil) adminFailures.delete(ip);
   return false;
 }
 
@@ -106,40 +112,73 @@ function hashUserAgent(req) {
   return crypto.createHash('sha256').update(String(req.headers['user-agent'] || '')).digest('hex');
 }
 
+function parseCookies(req) {
+  const out = {};
+  const header = String(req.headers.cookie || '');
+  for (const part of header.split(';')) {
+    const idx = part.indexOf('=');
+    if (idx > 0) {
+      out[part.slice(0, idx).trim()] = decodeURIComponent(part.slice(idx + 1).trim());
+    }
+  }
+  return out;
+}
+
 function issueAdminSession(ip, req) {
   const now = Date.now();
   for (const [t, s] of adminSessions.entries()) {
-    if (s.expiresAt < now) adminSessions.delete(t);
+    if (s.expiresAt < now || now - s.lastActiveAt > ADMIN_IDLE_TTL_MS) adminSessions.delete(t);
   }
   const token = crypto.randomBytes(32).toString('hex');
+  const csrfToken = crypto.randomBytes(24).toString('hex');
   adminSessions.set(token, {
     ip,
     uaHash: hashUserAgent(req),
-    expiresAt: now + ADMIN_SESSION_TTL_MS
+    csrfToken,
+    expiresAt: now + ADMIN_SESSION_TTL_MS,
+    lastActiveAt: now
   });
-  return token;
+  return { token, csrfToken };
 }
 
-function validateAdminBearer(req, ip) {
+function validateAdminSession(req, ip, requireCsrf = false) {
+  const cookies = parseCookies(req);
   const authHeader = String(req.headers.authorization || '');
-  if (!authHeader.startsWith('Bearer ')) return null;
-  const token = authHeader.slice(7).trim();
+  const bearerToken = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
+  const token = cookies.nn_admin_sid || bearerToken;
+
+  if (!token) return null;
   const sess = adminSessions.get(token);
   if (!sess) return null;
-  if (Date.now() > sess.expiresAt || sess.ip !== ip || sess.uaHash !== hashUserAgent(req)) {
+
+  const now = Date.now();
+  if (now > sess.expiresAt || now - sess.lastActiveAt > ADMIN_IDLE_TTL_MS) {
     adminSessions.delete(token);
     return null;
   }
-  return token;
+  if (sess.ip !== ip || sess.uaHash !== hashUserAgent(req)) {
+    adminSessions.delete(token);
+    db.logEvent({ eventType: 'admin_session_hijack_blocked', ip, details: 'IP/User-Agent mismatch' });
+    return null;
+  }
+  if (requireCsrf) {
+    const csrfHeader = String(req.headers['x-csrf-token'] || '');
+    const a = Buffer.from(csrfHeader, 'utf8');
+    const b = Buffer.from(sess.csrfToken, 'utf8');
+    if (a.length !== b.length || a.length === 0 || !crypto.timingSafeEqual(a, b)) {
+      return null;
+    }
+  }
+
+  sess.lastActiveAt = now;
+  return { token, sess };
 }
 
-// Sign payload with Ed25519 Private Key
 function signEnvelope(envelope) {
   const canonical = JSON.stringify(envelope);
   return crypto.sign(null, Buffer.from(canonical, 'utf8'), PRIVATE_KEY_PEM).toString('hex');
 }
 
-// Encrypt response payload using Ephemeral X25519 ECDH + HKDF-SHA256 + AES-256-GCM
 function encryptAndSignForClient(payload, clientEphemeralPubB64) {
   const clientPubKey = crypto.createPublicKey({
     key: Buffer.from(String(clientEphemeralPubB64), 'base64'),
@@ -179,14 +218,15 @@ function encryptAndSignForClient(payload, clientEphemeralPubB64) {
   return { envelope, signature };
 }
 
-function sendJson(res, statusCode, body) {
+function sendJson(res, statusCode, body, extraHeaders = {}) {
   const json = JSON.stringify(body);
   res.writeHead(statusCode, {
     'Content-Type': 'application/json; charset=utf-8',
     'Content-Length': Buffer.byteLength(json),
     'Cache-Control': 'no-store',
     'X-Content-Type-Options': 'nosniff',
-    'X-Frame-Options': 'DENY'
+    'X-Frame-Options': 'DENY',
+    ...extraHeaders
   });
   res.end(json);
 }
@@ -213,15 +253,42 @@ function readBody(req) {
 }
 
 const server = http.createServer(async (req, res) => {
-  const clientIp = req.socket.remoteAddress || 'unknown';
-  if (isRateLimited(clientIp)) {
+  const startedAt = Date.now();
+  const clientIp = normalizeIp(req.socket.remoteAddress);
+  const url = new URL(req.url, `http://127.0.0.1:${PORT}`);
+
+  // Record every non-polling API traffic hit into SQLite traffic_logs
+  res.on('finish', () => {
+    if (url.pathname.startsWith('/api/v1/') && url.pathname !== '/api/v1/admin/analytics') {
+      try {
+        db.logTraffic({
+          method: req.method,
+          path: url.pathname,
+          ip: clientIp,
+          statusCode: res.statusCode,
+          latencyMs: Math.max(0, Date.now() - startedAt),
+          userAgent: req.headers['user-agent'] || ''
+        });
+      } catch (_) {}
+    }
+  });
+
+  // 1. Check IP Ban List immediately
+  if (db.isIpBanned(clientIp)) {
+    db.logEvent({ eventType: 'banned_ip_blocked', ip: clientIp, details: `Blocked ${req.method} ${url.pathname}` });
+    return sendJson(res, 403, { ok: false, valid: false, error: 'Your IP address is blocked.' });
+  }
+
+  // 2. Rate limit (higher allowance for admin polling, strict on public auth)
+  if (!url.pathname.startsWith('/api/v1/admin/analytics') && isRateLimited(clientIp)) {
     return sendJson(res, 429, { valid: false, error: 'Rate limit exceeded. Wait 1 minute.' });
   }
 
-  const url = new URL(req.url, `http://127.0.0.1:${PORT}`);
-
-  // Serve strict CSP-hardened Admin UI and external admin.js
+  // 3. Serve CSP-hardened Admin UI & external script (only for allowlisted Admin IPs)
   if (req.method === 'GET' && (url.pathname === '/admin' || url.pathname === '/admin/')) {
+    if (!isAdminIpAllowed(clientIp)) {
+      return sendJson(res, 403, { ok: false, error: 'Admin panel restricted to allowlisted IPs' });
+    }
     const html = fs.readFileSync(path.join(__dirname, 'admin.html'), 'utf8');
     res.writeHead(200, {
       'Content-Type': 'text/html; charset=utf-8',
@@ -233,6 +300,9 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (req.method === 'GET' && url.pathname === '/admin.js') {
+    if (!isAdminIpAllowed(clientIp)) {
+      return sendJson(res, 403, { ok: false, error: 'Forbidden' });
+    }
     const js = fs.readFileSync(path.join(__dirname, 'admin.js'), 'utf8');
     res.writeHead(200, {
       'Content-Type': 'application/javascript; charset=utf-8',
@@ -251,7 +321,7 @@ const server = http.createServer(async (req, res) => {
     });
   }
 
-  // 1. License Auth (X25519 Encrypted + Ed25519 Signed)
+  // 4. Client Auth
   if (req.method === 'POST' && url.pathname === '/api/v1/auth/verify') {
     try {
       const { key, hwid, nonce, clientPub } = await readBody(req);
@@ -287,7 +357,7 @@ const server = http.createServer(async (req, res) => {
       }
 
       db.bindHwidAndTouch(cleanKey, String(hwid));
-      const session = db.createSession(cleanKey, String(hwid));
+      const session = db.createSession(cleanKey, String(hwid), clientIp);
       db.logEvent({ eventType: 'login_success', key: cleanKey, hwid: String(hwid), ip: clientIp, details: `Tier: ${record.tier}` });
 
       const payload = {
@@ -303,20 +373,19 @@ const server = http.createServer(async (req, res) => {
         issuedAt: Date.now()
       };
 
-      const sealed = encryptAndSignForClient(payload, clientPub);
-      return sendJson(res, 200, sealed);
+      return sendJson(res, 200, encryptAndSignForClient(payload, clientPub));
     } catch (_) {
       return sendJson(res, 400, { valid: false, error: 'Invalid request body' });
     }
   }
 
-  // 2. Active Session Heartbeat (auto-kicks revoked/reset-HWID sessions)
+  // 5. Client Heartbeat
   if (req.method === 'POST' && url.pathname === '/api/v1/auth/heartbeat') {
     try {
       const { sessionId, hwid } = await readBody(req);
       const sessionRow = db.getValidSession(String(sessionId || ''), String(hwid || ''));
       if (!sessionRow) {
-        return sendJson(res, 401, { active: false, error: 'Session expired or revoked' });
+        return sendJson(res, 401, { active: false, error: 'Session expired or terminated' });
       }
       const record = db.getLicense(sessionRow.license_key);
       if (!record || record.revoked || (record.hwid && record.hwid !== String(hwid))) {
@@ -333,7 +402,7 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
-  // 3. Server-Side Launch Authorization (X25519 Encrypted + Ed25519 Signed 30s Ticket)
+  // 6. Launch Authorization
   if (req.method === 'POST' && url.pathname === '/api/v1/software/authorize') {
     try {
       const { sessionId, hwid, productId, branch, nonce, clientPub } = await readBody(req);
@@ -386,14 +455,13 @@ const server = http.createServer(async (req, res) => {
         issuedAt: Date.now()
       };
 
-      const sealed = encryptAndSignForClient(payload, clientPub);
-      return sendJson(res, 200, sealed);
+      return sendJson(res, 200, encryptAndSignForClient(payload, clientPub));
     } catch (_) {
       return sendJson(res, 400, { ok: false, error: 'Invalid request body' });
     }
   }
 
-  // 4. Anti-Tamper Telemetry
+  // 7. Telemetry
   if (req.method === 'POST' && url.pathname === '/api/v1/telemetry') {
     try {
       const { eventType, hwid, key, details } = await readBody(req);
@@ -410,38 +478,96 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
-  // 5. Hardened Admin Authentication (Brute-force lockout + Ephemeral Bearer Session)
+  // 8. Admin Challenge-Response Auth (raw ADMIN_SECRET never crosses network!)
+  if (req.method === 'GET' && url.pathname === '/api/v1/admin/challenge') {
+    if (!isAdminIpAllowed(clientIp)) {
+      return sendJson(res, 403, { ok: false, error: 'IP not in ADMIN_ALLOWED_IPS' });
+    }
+    if (isAdminIpLocked(clientIp)) {
+      return sendJson(res, 429, { ok: false, error: 'Admin login locked for 15 minutes.' });
+    }
+    const now = Date.now();
+    for (const [c, meta] of adminChallenges.entries()) {
+      if (meta.expiresAt < now) adminChallenges.delete(c);
+    }
+    const challenge = crypto.randomBytes(24).toString('hex');
+    adminChallenges.set(challenge, { ip: clientIp, expiresAt: now + CHALLENGE_TTL_MS });
+    return sendJson(res, 200, { ok: true, challenge });
+  }
+
   if (req.method === 'POST' && url.pathname === '/api/v1/admin/login') {
+    if (!isAdminIpAllowed(clientIp)) {
+      return sendJson(res, 403, { ok: false, error: 'IP not in ADMIN_ALLOWED_IPS' });
+    }
     if (isAdminIpLocked(clientIp)) {
       return sendJson(res, 429, { ok: false, error: 'Admin login locked for 15 minutes due to failed attempts.' });
     }
     try {
-      const { secret } = await readBody(req);
-      if (!verifyAdminSecret(secret)) {
+      const { challenge, proof, secret } = await readBody(req);
+      let verified = false;
+
+      // Support Challenge-Response HMAC proof (browser admin) OR constant-time SHA-512 hash (CLI tools)
+      if (challenge && proof) {
+        const chMeta = adminChallenges.get(String(challenge));
+        adminChallenges.delete(String(challenge));
+        if (chMeta && chMeta.ip === clientIp && Date.now() <= chMeta.expiresAt) {
+          const expectedProof = crypto.createHmac('sha256', ADMIN_DIGEST_HEX).update(String(challenge)).digest('hex');
+          const a = Buffer.from(String(proof), 'hex');
+          const b = Buffer.from(expectedProof, 'hex');
+          if (a.length === b.length && a.length > 0 && crypto.timingSafeEqual(a, b)) {
+            verified = true;
+          }
+        }
+      } else if (secret) {
+        const inputHex = crypto.createHash('sha512').update(String(secret), 'utf8').digest('hex');
+        const a = Buffer.from(inputHex, 'hex');
+        const b = Buffer.from(ADMIN_DIGEST_HEX, 'hex');
+        if (a.length === b.length && crypto.timingSafeEqual(a, b)) {
+          verified = true;
+        }
+      }
+
+      if (!verified) {
         const fail = recordAdminFailure(clientIp);
         const remaining = Math.max(0, ADMIN_FAIL_LIMIT - fail.count);
-        return sendJson(res, 403, { ok: false, error: `Invalid ADMIN_SECRET (${remaining} attempts left)` });
+        return sendJson(res, 403, { ok: false, error: `Invalid credentials (${remaining} attempts left)` });
       }
+
       adminFailures.delete(clientIp);
-      const token = issueAdminSession(clientIp, req);
-      db.logEvent({ eventType: 'admin_login', ip: clientIp, details: 'Admin session issued (30m TTL)' });
-      return sendJson(res, 200, { ok: true, token, expiresInSec: ADMIN_SESSION_TTL_MS / 1000 });
+      const { token, csrfToken } = issueAdminSession(clientIp, req);
+      db.logEvent({ eventType: 'admin_login', ip: clientIp, details: 'Challenge-response verified (HttpOnly + CSRF)' });
+
+      return sendJson(
+        res,
+        200,
+        { ok: true, token, csrfToken, expiresInSec: ADMIN_SESSION_TTL_MS / 1000 },
+        { 'Set-Cookie': `nn_admin_sid=${token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${ADMIN_SESSION_TTL_MS / 1000}` }
+      );
     } catch (_) {
       return sendJson(res, 400, { ok: false, error: 'Invalid request body' });
     }
   }
 
   if (req.method === 'POST' && url.pathname === '/api/v1/admin/logout') {
-    const token = validateAdminBearer(req, clientIp);
-    if (token) adminSessions.delete(token);
-    return sendJson(res, 200, { ok: true });
+    const valid = validateAdminSession(req, clientIp, false);
+    if (valid) adminSessions.delete(valid.token);
+    return sendJson(
+      res,
+      200,
+      { ok: true },
+      { 'Set-Cookie': 'nn_admin_sid=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0' }
+    );
   }
 
-  // 6. Protected Admin Endpoints (Bearer Session Token required)
+  // 9. Protected Admin Routes
   if (url.pathname.startsWith('/api/v1/admin/')) {
-    const token = validateAdminBearer(req, clientIp);
-    if (!token) {
-      return sendJson(res, 401, { ok: false, error: 'Admin session missing or expired. Please authenticate.' });
+    if (!isAdminIpAllowed(clientIp)) {
+      return sendJson(res, 403, { ok: false, error: 'IP not allowlisted' });
+    }
+    const requireCsrf = req.method === 'POST';
+    const valid = validateAdminSession(req, clientIp, requireCsrf);
+    if (!valid) {
+      return sendJson(res, 401, { ok: false, error: 'Admin session missing, expired, or invalid CSRF token.' });
     }
 
     if (req.method === 'GET' && url.pathname === '/api/v1/admin/analytics') {
@@ -460,44 +586,73 @@ const server = http.createServer(async (req, res) => {
           const expiresAt = days === 'lifetime'
             ? null
             : new Date(Date.now() + (Number(days || 30) * 86400000)).toISOString();
-
           const created = db.createLicense({ key, username, tier, expiresAt, products, branches });
           db.logEvent({ eventType: 'key_created', key: created.key, ip: clientIp, details: `Tier: ${created.tier}` });
           return sendJson(res, 201, { ok: true, key: created.key, record: created });
         }
 
         if (action === 'reset-hwid' && key) {
-          const updated = db.resetLicenseHwid(key);
-          if (!updated) return sendJson(res, 404, { ok: false, error: 'Key not found' });
+          if (!db.resetLicenseHwid(key)) return sendJson(res, 404, { ok: false, error: 'Key not found' });
           db.revokeSessionsForKey(key);
           db.logEvent({ eventType: 'hwid_reset', key, ip: clientIp, details: 'Admin reset HWID & cleared sessions' });
-          return sendJson(res, 200, { ok: true, key, message: 'HWID reset' });
+          return sendJson(res, 200, { ok: true, key });
         }
 
         if (action === 'revoke' && key) {
-          const updated = db.setLicenseRevoked(key, true);
-          if (!updated) return sendJson(res, 404, { ok: false, error: 'Key not found' });
+          if (!db.setLicenseRevoked(key, true)) return sendJson(res, 404, { ok: false, error: 'Key not found' });
           db.revokeSessionsForKey(key);
           db.logEvent({ eventType: 'key_revoked', key, ip: clientIp, details: 'Admin revoked key & terminated sessions' });
-          return sendJson(res, 200, { ok: true, key, message: 'Key revoked' });
+          return sendJson(res, 200, { ok: true, key });
         }
 
         if (action === 'unrevoke' && key) {
-          const updated = db.setLicenseRevoked(key, false);
-          if (!updated) return sendJson(res, 404, { ok: false, error: 'Key not found' });
-          return sendJson(res, 200, { ok: true, key, message: 'Key restored' });
+          if (!db.setLicenseRevoked(key, false)) return sendJson(res, 404, { ok: false, error: 'Key not found' });
+          return sendJson(res, 200, { ok: true, key });
         }
 
         if (action === 'delete' && key) {
-          const deleted = db.deleteLicense(key);
-          if (!deleted) return sendJson(res, 404, { ok: false, error: 'Key not found' });
-          return sendJson(res, 200, { ok: true, key, message: 'Key deleted' });
+          if (!db.deleteLicense(key)) return sendJson(res, 404, { ok: false, error: 'Key not found' });
+          return sendJson(res, 200, { ok: true, key });
         }
 
         return sendJson(res, 400, { ok: false, error: 'Unknown admin action' });
       } catch (err) {
         return sendJson(res, 400, { ok: false, error: err.message || 'Invalid JSON' });
       }
+    }
+
+    if (req.method === 'POST' && url.pathname === '/api/v1/admin/sessions/kick') {
+      const { sessionId } = await readBody(req);
+      if (!sessionId || !db.deleteSession(String(sessionId))) {
+        return sendJson(res, 404, { ok: false, error: 'Session not found' });
+      }
+      db.logEvent({ eventType: 'session_kicked', ip: clientIp, details: `Kicked session ${String(sessionId).slice(0, 10)}…` });
+      return sendJson(res, 200, { ok: true });
+    }
+
+    if (req.method === 'POST' && url.pathname === '/api/v1/admin/ips') {
+      const { action, ip, reason } = await readBody(req);
+      const cleanIp = normalizeIp(ip);
+      if (!cleanIp || cleanIp === 'unknown') {
+        return sendJson(res, 400, { ok: false, error: 'Invalid IP' });
+      }
+      if (action === 'ban') {
+        db.banIp(cleanIp, reason || 'Blocked by admin');
+        db.logEvent({ eventType: 'ip_banned', ip: cleanIp, details: reason || 'Banned via Admin Panel' });
+        return sendJson(res, 200, { ok: true });
+      }
+      if (action === 'unban') {
+        db.unbanIp(cleanIp);
+        db.logEvent({ eventType: 'ip_unbanned', ip: cleanIp, details: 'Unbanned via Admin Panel' });
+        return sendJson(res, 200, { ok: true });
+      }
+      return sendJson(res, 400, { ok: false, error: 'Unknown IP action' });
+    }
+
+    if (req.method === 'POST' && url.pathname === '/api/v1/admin/logs/clear') {
+      db.clearLogs();
+      db.logEvent({ eventType: 'logs_cleared', ip: clientIp, details: 'Admin cleared traffic & event logs' });
+      return sendJson(res, 200, { ok: true });
     }
   }
 

@@ -27,6 +27,7 @@ db.exec(`
     session_id TEXT PRIMARY KEY,
     license_key TEXT NOT NULL,
     hwid TEXT NOT NULL,
+    ip TEXT,
     expires_at INTEGER NOT NULL,
     created_at INTEGER NOT NULL,
     FOREIGN KEY (license_key) REFERENCES licenses(key) ON DELETE CASCADE
@@ -43,16 +44,39 @@ db.exec(`
     details TEXT,
     created_at TEXT NOT NULL
   );
+
+  CREATE TABLE IF NOT EXISTS traffic_logs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    method TEXT NOT NULL,
+    path TEXT NOT NULL,
+    ip TEXT NOT NULL,
+    status_code INTEGER NOT NULL,
+    latency_ms INTEGER NOT NULL,
+    user_agent TEXT,
+    created_at TEXT NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS blocked_ips (
+    ip TEXT PRIMARY KEY,
+    reason TEXT,
+    blocked_at TEXT NOT NULL
+  );
 `);
+
+// Ensure existing tables created prior to ip column get ip column safely
+try {
+  db.exec('ALTER TABLE sessions ADD COLUMN ip TEXT');
+} catch (_) {
+  // Column already exists
+}
 
 function seedInitialDemoKey() {
   const countRow = db.prepare('SELECT COUNT(*) AS cnt FROM licenses').get();
   if (countRow && countRow.cnt === 0) {
-    const stmt = db.prepare(`
+    db.prepare(`
       INSERT INTO licenses (key, username, tier, expires_at, hwid, revoked, products_json, branches_json, created_at)
       VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?)
-    `);
-    stmt.run(
+    `).run(
       'NN-DEMO-2026-OPEN',
       'Developer',
       'Enterprise',
@@ -84,13 +108,11 @@ function mapLicenseRow(row) {
 }
 
 function getLicense(key) {
-  const row = db.prepare('SELECT * FROM licenses WHERE key = ?').get(key);
-  return mapLicenseRow(row);
+  return mapLicenseRow(db.prepare('SELECT * FROM licenses WHERE key = ?').get(key));
 }
 
 function listLicenses() {
-  const rows = db.prepare('SELECT * FROM licenses ORDER BY created_at DESC').all();
-  return rows.map(mapLicenseRow);
+  return db.prepare('SELECT * FROM licenses ORDER BY created_at DESC').all().map(mapLicenseRow);
 }
 
 function bindHwidAndTouch(key, hwid) {
@@ -130,29 +152,27 @@ function createLicense({ key, username, tier, expiresAt, products, branches }) {
 }
 
 function resetLicenseHwid(key) {
-  const res = db.prepare('UPDATE licenses SET hwid = NULL WHERE key = ?').run(key);
-  return res.changes > 0;
+  return db.prepare('UPDATE licenses SET hwid = NULL WHERE key = ?').run(key).changes > 0;
 }
 
 function setLicenseRevoked(key, revoked) {
-  const res = db.prepare('UPDATE licenses SET revoked = ? WHERE key = ?').run(revoked ? 1 : 0, key);
-  return res.changes > 0;
+  return db.prepare('UPDATE licenses SET revoked = ? WHERE key = ?').run(revoked ? 1 : 0, key).changes > 0;
 }
 
 function deleteLicense(key) {
-  const res = db.prepare('DELETE FROM licenses WHERE key = ?').run(key);
-  return res.changes > 0;
+  return db.prepare('DELETE FROM licenses WHERE key = ?').run(key).changes > 0;
 }
 
-function createSession(licenseKey, hwid, ttlMs = 12 * 60 * 60 * 1000) {
+function createSession(licenseKey, hwid, ip = null, ttlMs = 12 * 60 * 60 * 1000) {
   const sessionId = crypto.randomBytes(24).toString('hex');
   const now = Date.now();
   const expiresAt = now + ttlMs;
   db.prepare('DELETE FROM sessions WHERE expires_at < ?').run(now);
-  db.prepare('INSERT INTO sessions (session_id, license_key, hwid, expires_at, created_at) VALUES (?, ?, ?, ?, ?)').run(
+  db.prepare('INSERT INTO sessions (session_id, license_key, hwid, ip, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?)').run(
     sessionId,
     licenseKey,
     hwid,
+    ip,
     expiresAt,
     now
   );
@@ -167,13 +187,18 @@ function getValidSession(sessionId, hwid) {
   return row;
 }
 
+function listActiveSessions() {
+  const now = Date.now();
+  db.prepare('DELETE FROM sessions WHERE expires_at < ?').run(now);
+  return db.prepare('SELECT session_id, license_key, hwid, ip, expires_at, created_at FROM sessions ORDER BY created_at DESC').all();
+}
+
 function revokeSessionsForKey(licenseKey) {
-  const res = db.prepare('DELETE FROM sessions WHERE license_key = ?').run(licenseKey);
-  return res.changes;
+  return db.prepare('DELETE FROM sessions WHERE license_key = ?').run(licenseKey).changes;
 }
 
 function deleteSession(sessionId) {
-  db.prepare('DELETE FROM sessions WHERE session_id = ?').run(sessionId);
+  return db.prepare('DELETE FROM sessions WHERE session_id = ?').run(sessionId).changes > 0;
 }
 
 function logEvent({ eventType, key = null, hwid = null, ip = null, productId = null, branch = null, details = null }) {
@@ -183,25 +208,76 @@ function logEvent({ eventType, key = null, hwid = null, ip = null, productId = n
   `).run(eventType, key, hwid, ip, productId, branch, details, new Date().toISOString());
 }
 
+function logTraffic({ method, path: reqPath, ip, statusCode, latencyMs, userAgent = '' }) {
+  db.prepare(`
+    INSERT INTO traffic_logs (method, path, ip, status_code, latency_ms, user_agent, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+  `).run(method, reqPath, ip, statusCode, latencyMs, String(userAgent).slice(0, 140), new Date().toISOString());
+  // Keep latest 1000 traffic entries so DB stays compact
+  db.prepare('DELETE FROM traffic_logs WHERE id <= (SELECT MAX(id) - 1000 FROM traffic_logs)').run();
+}
+
+function isIpBanned(ip) {
+  return Boolean(db.prepare('SELECT 1 FROM blocked_ips WHERE ip = ?').get(ip));
+}
+
+function banIp(ip, reason = 'Blocked by administrator') {
+  db.prepare(`
+    INSERT INTO blocked_ips (ip, reason, blocked_at)
+    VALUES (?, ?, ?)
+    ON CONFLICT(ip) DO UPDATE SET reason = excluded.reason, blocked_at = excluded.blocked_at
+  `).run(ip, reason, new Date().toISOString());
+}
+
+function unbanIp(ip) {
+  return db.prepare('DELETE FROM blocked_ips WHERE ip = ?').run(ip).changes > 0;
+}
+
+function listBannedIps() {
+  return db.prepare('SELECT * FROM blocked_ips ORDER BY blocked_at DESC').all();
+}
+
+function clearLogs() {
+  db.exec('DELETE FROM traffic_logs; DELETE FROM analytics_events;');
+}
+
 function getAnalyticsSummary() {
+  const now = Date.now();
+  const oneMinAgoIso = new Date(now - 60_000).toISOString();
+
   const totalLicenses = db.prepare('SELECT COUNT(*) AS c FROM licenses').get().c;
   const activeLicenses = db.prepare('SELECT COUNT(*) AS c FROM licenses WHERE revoked = 0').get().c;
-  const activeSessions = db.prepare('SELECT COUNT(*) AS c FROM sessions WHERE expires_at > ?').get(Date.now()).c;
+  const activeSessionsCount = db.prepare('SELECT COUNT(*) AS c FROM sessions WHERE expires_at > ?').get(now).c;
   const totalLaunches = db.prepare('SELECT COALESCE(SUM(launch_count), 0) AS s FROM licenses').get().s;
   const securityAlerts = db
-    .prepare("SELECT COUNT(*) AS c FROM analytics_events WHERE event_type IN ('anti_tamper_alert', 'hwid_mismatch', 'replay_detected')")
+    .prepare("SELECT COUNT(*) AS c FROM analytics_events WHERE event_type IN ('anti_tamper_alert', 'hwid_mismatch', 'replay_detected', 'admin_bruteforce_blocked', 'banned_ip_blocked')")
     .get().c;
-  const recentEvents = db.prepare('SELECT * FROM analytics_events ORDER BY id DESC LIMIT 40').all();
+  const rpm = db.prepare('SELECT COUNT(*) AS c FROM traffic_logs WHERE created_at >= ?').get(oneMinAgoIso).c;
+  const avgLatencyMs = Math.round(
+    db.prepare('SELECT COALESCE(AVG(latency_ms), 0) AS a FROM (SELECT latency_ms FROM traffic_logs ORDER BY id DESC LIMIT 100)').get().a
+  );
+  const bannedCount = db.prepare('SELECT COUNT(*) AS c FROM blocked_ips').get().c;
+
+  const recentEvents = db.prepare('SELECT * FROM analytics_events ORDER BY id DESC LIMIT 60').all();
+  const trafficLogs = db.prepare('SELECT * FROM traffic_logs ORDER BY id DESC LIMIT 80').all();
+  const activeSessions = listActiveSessions();
+  const bannedIps = listBannedIps();
 
   return {
     stats: {
       totalLicenses,
       activeLicenses,
-      activeSessions,
+      activeSessions: activeSessionsCount,
       totalLaunches,
-      securityAlerts
+      securityAlerts,
+      rpm,
+      avgLatencyMs,
+      bannedCount
     },
-    recentEvents
+    recentEvents,
+    trafficLogs,
+    activeSessions,
+    bannedIps
   };
 }
 
@@ -216,8 +292,15 @@ module.exports = {
   deleteLicense,
   createSession,
   getValidSession,
+  listActiveSessions,
   revokeSessionsForKey,
   deleteSession,
   logEvent,
+  logTraffic,
+  isIpBanned,
+  banIp,
+  unbanIp,
+  listBannedIps,
+  clearLogs,
   getAnalyticsSummary
 };
