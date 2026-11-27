@@ -240,6 +240,16 @@
     showToast('Signed out');
   });
 
+  if (isElectron && typeof window.electronAPI.onSessionInvalidated === 'function') {
+    window.electronAPI.onSessionInvalidated((reason) => {
+      activeSession = null;
+      workspace.classList.add('hidden');
+      authGate.classList.remove('hidden');
+      authError.textContent = reason || 'Session revoked by server';
+      showToast('Session revoked');
+    });
+  }
+
   function resetLaunchState() {
     const btn = document.getElementById('launchBtn');
     const txt = document.getElementById('launchBtnText');

@@ -22,14 +22,18 @@ function obfuscateFile(filePath) {
   const raw = fs.readFileSync(filePath, 'utf8');
   const result = JavaScriptObfuscator.obfuscate(raw, {
     compact: true,
-    controlFlowFlattening: false,
+    controlFlowFlattening: true,
+    controlFlowFlatteningThreshold: 0.35,
     deadCodeInjection: false,
     identifierNamesGenerator: 'hexadecimal',
     renameGlobals: false,
     selfDefending: false,
+    splitStrings: true,
+    splitStringsChunkLength: 8,
+    transformObjectKeys: true,
     stringArray: true,
-    stringArrayEncoding: ['base64'],
-    stringArrayThreshold: 0.75,
+    stringArrayEncoding: ['rc4'],
+    stringArrayThreshold: 0.85,
     unicodeEscapeSequence: false
   });
   fs.writeFileSync(filePath, result.getObfuscatedCode(), 'utf8');

@@ -167,6 +167,15 @@ function getValidSession(sessionId, hwid) {
   return row;
 }
 
+function revokeSessionsForKey(licenseKey) {
+  const res = db.prepare('DELETE FROM sessions WHERE license_key = ?').run(licenseKey);
+  return res.changes;
+}
+
+function deleteSession(sessionId) {
+  db.prepare('DELETE FROM sessions WHERE session_id = ?').run(sessionId);
+}
+
 function logEvent({ eventType, key = null, hwid = null, ip = null, productId = null, branch = null, details = null }) {
   db.prepare(`
     INSERT INTO analytics_events (event_type, license_key, hwid, ip, product_id, branch, details, created_at)
@@ -207,6 +216,8 @@ module.exports = {
   deleteLicense,
   createSession,
   getValidSession,
+  revokeSessionsForKey,
+  deleteSession,
   logEvent,
   getAnalyticsSummary
 };

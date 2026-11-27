@@ -6,7 +6,7 @@ const http = require('http');
 const https = require('https');
 const crypto = require('crypto');
 const { execFile } = require('child_process');
-const { SDK_CONFIG, verifyEd25519Signature, executeLaunchHook } = require('./sdk/loader-sdk');
+const { SDK_CONFIG, decryptServerEnvelope, executeLaunchHook } = require('./sdk/loader-sdk');
 
 app.enableSandbox();
 
@@ -17,8 +17,8 @@ if (!gotLock) {
 
 let mainWindow = null;
 let activeSession = null;
+let heartbeatTimer = null;
 
-// Direct agents ignore HTTP_PROXY / HTTPS_PROXY environment hijacking
 const directHttpAgent = new http.Agent({ keepAlive: false });
 const directHttpsAgent = new https.Agent({ keepAlive: false, rejectUnauthorized: true });
 
@@ -46,7 +46,6 @@ function hasDebuggerArgs() {
   );
 }
 
-// Defensive environment check for active analysis / sniffing tools (only enforced when packaged)
 function detectAnalysisTools() {
   if (!app.isPackaged || process.platform !== 'win32') {
     return Promise.resolve(null);
@@ -129,10 +128,9 @@ function postJson(targetUrl, bodyObj) {
         }
       },
       (res) => {
-        // Optional TLS SPKI / Certificate Pinning against MITM proxies
         if (isHttps && SDK_CONFIG.pinnedCertSha256 && res.socket && typeof res.socket.getPeerCertificate === 'function') {
           const cert = res.socket.getPeerCertificate();
-          const fp = (cert && cert.fingerprint256 || '').replace(/:/g, '').toLowerCase();
+          const fp = ((cert && cert.fingerprint256) || '').replace(/:/g, '').toLowerCase();
           if (!fp || fp !== SDK_CONFIG.pinnedCertSha256.toLowerCase()) {
             res.destroy();
             return reject(new Error('TLS certificate pinning mismatch'));
@@ -161,13 +159,43 @@ function postJson(targetUrl, bodyObj) {
 }
 
 function sendTelemetry(eventType, details, key = null) {
-  const apiUrl = SDK_CONFIG.getApiBaseUrl(app.isPackaged);
+  const apiUrl = SDK_CONFIG.getApiBaseUrl();
   postJson(`${apiUrl}/api/v1/telemetry`, {
     eventType,
     hwid: getDeviceHwid(),
     key,
     details
   }).catch(() => {});
+}
+
+function stopHeartbeat() {
+  if (heartbeatTimer) {
+    clearInterval(heartbeatTimer);
+    heartbeatTimer = null;
+  }
+}
+
+function startHeartbeat() {
+  stopHeartbeat();
+  heartbeatTimer = setInterval(async () => {
+    if (!activeSession || !activeSession.sessionId) return;
+    const apiUrl = SDK_CONFIG.getApiBaseUrl();
+    try {
+      const res = await postJson(`${apiUrl}/api/v1/auth/heartbeat`, {
+        sessionId: activeSession.sessionId,
+        hwid: getDeviceHwid()
+      });
+      if (res.status !== 200 || !res.data || !res.data.active) {
+        activeSession = null;
+        stopHeartbeat();
+        if (mainWindow && !mainWindow.isDestroyed()) {
+          mainWindow.webContents.send('auth:session-invalidated', (res.data && res.data.error) || 'Session terminated by server');
+        }
+      }
+    } catch (_) {
+      // Transient network hiccup ignored until next launch/heartbeat
+    }
+  }, 60_000);
 }
 
 function createWindow() {
@@ -242,6 +270,7 @@ ipcMain.on('window:minimize', () => {
 });
 
 ipcMain.on('window:close', () => {
+  stopHeartbeat();
   if (mainWindow && !mainWindow.isDestroyed()) {
     mainWindow.close();
   }
@@ -256,7 +285,7 @@ ipcMain.on('shell:open-external', (_event, url) => {
 ipcMain.handle('auth:get-device-info', () => {
   return {
     hwid: getDeviceHwid(),
-    apiBaseUrl: SDK_CONFIG.getApiBaseUrl(app.isPackaged),
+    apiBaseUrl: SDK_CONFIG.getApiBaseUrl(),
     catalog: SDK_CONFIG.softwareCatalog
   };
 });
@@ -275,34 +304,41 @@ ipcMain.handle('auth:verify-key', async (_event, keyInput) => {
 
   const hwid = getDeviceHwid();
   const nonce = crypto.randomBytes(12).toString('hex');
-  const apiUrl = SDK_CONFIG.getApiBaseUrl(app.isPackaged);
+  const ecdh = crypto.generateKeyPairSync('x25519');
+  const clientPub = ecdh.publicKey.export({ format: 'der', type: 'spki' }).toString('base64');
+  const apiUrl = SDK_CONFIG.getApiBaseUrl();
 
   try {
     const res = await postJson(`${apiUrl}/api/v1/auth/verify`, {
       key: cleanKey,
       hwid,
-      nonce
+      nonce,
+      clientPub
     });
 
-    if (res.status !== 200 || !res.data || !res.data.payload) {
+    if (res.status !== 200 || !res.data || !res.data.envelope) {
       return { ok: false, error: (res.data && res.data.error) || 'License verification rejected' };
     }
 
-    const { payload, signature } = res.data;
-    if (!verifyEd25519Signature(payload, signature)) {
-      sendTelemetry('anti_tamper_alert', 'Invalid Ed25519 auth signature received', cleanKey);
-      return { ok: false, error: 'Tamper check failed: invalid Ed25519 signature' };
-    }
-    if (payload.nonce !== nonce || payload.hwid !== hwid) {
-      return { ok: false, error: 'Session mismatch detected' };
-    }
-    if (Math.abs(Date.now() - Number(payload.issuedAt || 0)) > 60_000) {
-      return { ok: false, error: 'Stale license response rejected' };
+    const payload = decryptServerEnvelope({
+      envelope: res.data.envelope,
+      signature: res.data.signature,
+      clientPrivateKey: ecdh.privateKey,
+      expectedNonce: nonce
+    });
+
+    if (payload.hwid !== hwid) {
+      return { ok: false, error: 'HWID mismatch detected' };
     }
 
-    activeSession = { ...payload, key: cleanKey, mode: 'online-ed25519' };
+    activeSession = { ...payload, key: cleanKey, mode: 'e2e-x25519+ed25519' };
+    startHeartbeat();
     return { ok: true, session: activeSession };
   } catch (err) {
+    if (String(err.message || '').includes('Tamper')) {
+      sendTelemetry('anti_tamper_alert', err.message, cleanKey);
+      return { ok: false, error: err.message };
+    }
     return {
       ok: false,
       error: `Backend unreachable (${apiUrl}). Start server: npm run server`
@@ -312,6 +348,7 @@ ipcMain.handle('auth:verify-key', async (_event, keyInput) => {
 
 ipcMain.handle('auth:logout', () => {
   activeSession = null;
+  stopHeartbeat();
   return { ok: true };
 });
 
@@ -328,34 +365,36 @@ ipcMain.handle('software:launch', async (_event, { productId, branch }) => {
 
   const hwid = getDeviceHwid();
   const nonce = crypto.randomBytes(12).toString('hex');
-  const apiUrl = SDK_CONFIG.getApiBaseUrl(app.isPackaged);
+  const ecdh = crypto.generateKeyPairSync('x25519');
+  const clientPub = ecdh.publicKey.export({ format: 'der', type: 'spki' }).toString('base64');
+  const apiUrl = SDK_CONFIG.getApiBaseUrl();
 
   try {
-    // Request a fresh server-signed launch ticket (no offline launch allowed)
     const res = await postJson(`${apiUrl}/api/v1/software/authorize`, {
       sessionId: activeSession.sessionId,
       hwid,
       productId,
       branch,
-      nonce
+      nonce,
+      clientPub
     });
 
-    if (res.status !== 200 || !res.data || !res.data.payload) {
+    if (res.status !== 200 || !res.data || !res.data.envelope) {
       return { ok: false, error: (res.data && res.data.error) || 'Backend rejected launch' };
     }
 
-    const { payload, signature } = res.data;
-    if (payload.nonce !== nonce || payload.hwid !== hwid) {
-      return { ok: false, error: 'Launch ticket mismatch' };
+    const ticketPayload = decryptServerEnvelope({
+      envelope: res.data.envelope,
+      signature: res.data.signature,
+      clientPrivateKey: ecdh.privateKey,
+      expectedNonce: nonce
+    });
+
+    if (ticketPayload.hwid !== hwid) {
+      return { ok: false, error: 'Launch ticket HWID mismatch' };
     }
 
-    const result = await executeLaunchHook({
-      productId,
-      branch,
-      ticketPayload: payload,
-      ticketSignature: signature
-    });
-    return result;
+    return await executeLaunchHook({ productId, branch, ticketPayload });
   } catch (err) {
     return { ok: false, error: err.message || 'Launch authorization failed' };
   }
@@ -372,6 +411,7 @@ app.whenReady().then(() => {
 });
 
 app.on('window-all-closed', () => {
+  stopHeartbeat();
   if (process.platform !== 'darwin') {
     app.quit();
   }

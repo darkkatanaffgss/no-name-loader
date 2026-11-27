@@ -1,7 +1,7 @@
 {
   "name": "no-name-loader",
-  "version": "1.0.0",
-  "description": "Open-source glassmorphic loader UI, License API & SDK template built with Electron.",
+  "version": "2.2.0",
+  "description": "Open-source glassmorphic loader UI, X25519+Ed25519 License API & SDK.",
   "main": "main.js",
   "scripts": {
     "setup": "node scripts/setup-keys.js",

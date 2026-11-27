@@ -17,7 +17,7 @@ exports.default = async function afterPack(context) {
       OriginalFilename: 'no name.exe',
       ProductName: 'no name'
     },
-    'file-version': '1.0.0',
-    'product-version': '1.0.0'
+    'file-version': '2.2.0',
+    'product-version': '2.2.0'
   });
 };

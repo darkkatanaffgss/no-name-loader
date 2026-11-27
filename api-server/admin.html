@@ -56,7 +56,7 @@
     .pill.green { background: rgba(34,197,94,0.18); color: #86efac; }
     .actions { display: flex; gap: 6px; flex-wrap: wrap; }
     .actions button { height: 28px; padding: 0 9px; font-size: 11px; border-radius: 7px; }
-    .hidden { display: none; }
+    .hidden { display: none !important; }
     .err { color: #f87171; font-size: 12px; margin-top: 6px; }
   </style>
 </head>
@@ -67,17 +67,18 @@
         <div class="badge">NN</div>
         <div>
           <div style="font-weight:600;font-size:15px;">no name — Admin & Analytics</div>
-          <div style="font-size:12px;color:#7c8494;">SQLite + Ed25519 License Management</div>
+          <div style="font-size:12px;color:#7c8494;">SQLite + Ephemeral Bearer Auth + Brute-Force Protection</div>
         </div>
       </div>
       <div class="auth-row">
-        <input type="password" id="adminSecret" placeholder="Paste ADMIN_SECRET from api-server/.env" style="width:290px;" />
-        <button class="primary" id="connectBtn">Connect</button>
+        <input type="password" id="adminSecret" placeholder="Enter ADMIN_SECRET from api-server/.env" style="width:290px;" />
+        <button type="button" class="primary" id="connectBtn">Sign In</button>
+        <button type="button" class="danger hidden" id="logoutAdminBtn">Sign Out</button>
       </div>
     </div>
     <div id="errBox" class="err"></div>
 
-    <div id="dashboard" class="hidden" style="display:flex;flex-direction:column;gap:18px;">
+    <div id="dashboard" style="display:none;flex-direction:column;gap:18px;">
       <div class="stats-grid">
         <div class="stat-card"><div class="stat-label">Total Keys</div><div class="stat-val" id="sTotal">0</div></div>
         <div class="stat-card"><div class="stat-label">Active Keys</div><div class="stat-val" id="sActive">0</div></div>
@@ -112,7 +113,7 @@
           <label><input type="checkbox" class="br-chk" value="Beta" checked /> Beta</label>
           <label><input type="checkbox" class="br-chk" value="Nightly" checked /> Nightly</label>
         </div>
-        <button class="primary" id="createKeyBtn">Generate Key</button>
+        <button type="button" class="primary" id="createKeyBtn">Generate Key</button>
       </div>
 
       <div class="panel">
@@ -139,95 +140,6 @@
     </div>
   </div>
 
-  <script>
-    const secretInput = document.getElementById('adminSecret');
-    const dashboard = document.getElementById('dashboard');
-    const errBox = document.getElementById('errBox');
-    dashboard.style.display = 'none';
-
-    async function api(path, method = 'GET', body = null) {
-      const res = await fetch(path, {
-        method,
-        headers: {
-          'Content-Type': 'application/json',
-          'x-admin-secret': secretInput.value.trim()
-        },
-        body: body ? JSON.stringify(body) : null
-      });
-      return res.json();
-    }
-
-    async function refresh() {
-      errBox.textContent = '';
-      const data = await api('/api/v1/admin/analytics');
-      if (!data.ok) {
-        dashboard.style.display = 'none';
-        errBox.textContent = data.error || 'Authentication failed';
-        return;
-      }
-      dashboard.style.display = 'flex';
-      document.getElementById('sTotal').textContent = data.stats.totalLicenses;
-      document.getElementById('sActive').textContent = data.stats.activeLicenses;
-      document.getElementById('sSessions').textContent = data.stats.activeSessions;
-      document.getElementById('sLaunches').textContent = data.stats.totalLaunches;
-      document.getElementById('sAlerts').textContent = data.stats.securityAlerts;
-
-      const lBody = document.getElementById('licensesBody');
-      lBody.innerHTML = '';
-      for (const lic of data.licenses) {
-        const tr = document.createElement('tr');
-        tr.innerHTML = `
-          <td><code>${lic.key}</code></td>
-          <td>${lic.username}</td>
-          <td>${lic.tier}</td>
-          <td><code>${lic.hwid ? lic.hwid.slice(0, 10) + '…' : 'Unbound'}</code></td>
-          <td>${lic.launchCount}</td>
-          <td><span class="pill ${lic.revoked ? 'red' : 'green'}">${lic.revoked ? 'Revoked' : 'Active'}</span></td>
-          <td class="actions">
-            <button onclick="navigator.clipboard.writeText('${lic.key}')">Copy</button>
-            <button onclick="keyAction('reset-hwid', '${lic.key}')">Reset HWID</button>
-            <button onclick="keyAction('${lic.revoked ? 'unrevoke' : 'revoke'}', '${lic.key}')">${lic.revoked ? 'Restore' : 'Revoke'}</button>
-            <button class="danger" onclick="keyAction('delete', '${lic.key}')">Delete</button>
-          </td>
-        `;
-        lBody.appendChild(tr);
-      }
-
-      const eBody = document.getElementById('eventsBody');
-      eBody.innerHTML = '';
-      for (const ev of data.recentEvents) {
-        const isAlert = ['anti_tamper_alert', 'hwid_mismatch', 'replay_detected'].includes(ev.event_type);
-        const tr = document.createElement('tr');
-        tr.innerHTML = `
-          <td>${new Date(ev.created_at).toLocaleTimeString()}</td>
-          <td><span class="pill ${isAlert ? 'red' : ''}">${ev.event_type}</span></td>
-          <td><code>${ev.license_key || '—'}</code></td>
-          <td>${ev.product_id ? ev.product_id + ' / ' + (ev.branch || '') : '—'}</td>
-          <td>${ev.details || ''}</td>
-        `;
-        eBody.appendChild(tr);
-      }
-    }
-
-    window.keyAction = async function(action, key) {
-      await api('/api/v1/admin/keys', 'POST', { action, key });
-      refresh();
-    };
-
-    document.getElementById('connectBtn').addEventListener('click', refresh);
-    document.getElementById('createKeyBtn').addEventListener('click', async () => {
-      const products = [...document.querySelectorAll('.prod-chk:checked')].map(c => c.value);
-      const branches = [...document.querySelectorAll('.br-chk:checked')].map(c => c.value);
-      await api('/api/v1/admin/keys', 'POST', {
-        action: 'create',
-        username: document.getElementById('newUser').value || 'Customer',
-        tier: document.getElementById('newTier').value,
-        days: document.getElementById('newDays').value,
-        products,
-        branches
-      });
-      refresh();
-    });
-  </script>
+  <script src="/admin.js"></script>
 </body>
 </html>

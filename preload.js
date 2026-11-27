@@ -8,5 +8,6 @@ contextBridge.exposeInMainWorld('electronAPI', {
   getDeviceInfo: () => ipcRenderer.invoke('auth:get-device-info'),
   verifyLicense: (key) => ipcRenderer.invoke('auth:verify-key', key),
   logout: () => ipcRenderer.invoke('auth:logout'),
-  launchSoftware: (payload) => ipcRenderer.invoke('software:launch', payload)
+  launchSoftware: (payload) => ipcRenderer.invoke('software:launch', payload),
+  onSessionInvalidated: (cb) => ipcRenderer.on('auth:session-invalidated', (_e, reason) => cb(reason))
 });
