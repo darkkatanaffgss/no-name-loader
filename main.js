@@ -5,9 +5,9 @@ const fs = require('fs');
 const http = require('http');
 const https = require('https');
 const crypto = require('crypto');
-const { SDK_CONFIG, executeLaunchHook } = require('./sdk/loader-sdk');
+const { execFile } = require('child_process');
+const { SDK_CONFIG, verifyEd25519Signature, executeLaunchHook } = require('./sdk/loader-sdk');
 
-// Enable Chromium OS sandbox globally
 app.enableSandbox();
 
 const gotLock = app.requestSingleInstanceLock();
@@ -17,6 +17,53 @@ if (!gotLock) {
 
 let mainWindow = null;
 let activeSession = null;
+
+// Direct agents ignore HTTP_PROXY / HTTPS_PROXY environment hijacking
+const directHttpAgent = new http.Agent({ keepAlive: false });
+const directHttpsAgent = new https.Agent({ keepAlive: false, rejectUnauthorized: true });
+
+const BLOCKED_ANALYSIS_TOOLS = [
+  'ida.exe',
+  'ida64.exe',
+  'x64dbg.exe',
+  'x32dbg.exe',
+  'ollydbg.exe',
+  'wireshark.exe',
+  'fiddler.exe',
+  'httpdebuggerui.exe',
+  'httpdebuggerpro.exe',
+  'dnspy.exe',
+  'cheatengine-x86_64.exe',
+  'processhacker.exe'
+];
+
+function hasDebuggerArgs() {
+  const combined = [...process.execArgv, ...process.argv].join(' ').toLowerCase();
+  return (
+    combined.includes('--inspect') ||
+    combined.includes('--remote-debugging-port') ||
+    combined.includes('--debug-brk')
+  );
+}
+
+// Defensive environment check for active analysis / sniffing tools (only enforced when packaged)
+function detectAnalysisTools() {
+  if (!app.isPackaged || process.platform !== 'win32') {
+    return Promise.resolve(null);
+  }
+  return new Promise((resolve) => {
+    execFile('tasklist', ['/FO', 'CSV', '/NH'], { timeout: 2500 }, (err, stdout) => {
+      if (err || !stdout) return resolve(null);
+      const lower = stdout.toLowerCase();
+      for (const proc of BLOCKED_ANALYSIS_TOOLS) {
+        if (lower.includes(`"${proc}"`)) {
+          return resolve(proc);
+        }
+      }
+      resolve(null);
+    });
+  });
+}
 
 function getDeviceHwid() {
   const nets = os.networkInterfaces();
@@ -36,21 +83,8 @@ function getDeviceHwid() {
   return crypto.createHash('sha256').update(raw).digest('hex').slice(0, 24).toUpperCase();
 }
 
-function verifyApiSignature(payload, signature) {
-  const expected = crypto
-    .createHmac('sha256', SDK_CONFIG.hmacSecret)
-    .update(JSON.stringify(payload))
-    .digest('hex');
-
-  const a = Buffer.from(String(signature || ''), 'hex');
-  const b = Buffer.from(expected, 'hex');
-  if (a.length !== b.length || a.length === 0) return false;
-  return crypto.timingSafeEqual(a, b);
-}
-
-// Verify file existence and SHA-256 integrity manifest when packaged
 function verifyAppIntegrity() {
-  const criticalFiles = ['index.html', 'styles.css', 'renderer.js', 'preload.js', 'sdk/loader-sdk.js'];
+  const criticalFiles = ['index.html', 'styles.css', 'renderer.js', 'preload.js', 'sdk/loader-sdk.js', 'sdk/public-config.json'];
   for (const file of criticalFiles) {
     const p = path.join(__dirname, file);
     if (!fs.existsSync(p)) {
@@ -77,22 +111,34 @@ function verifyAppIntegrity() {
 function postJson(targetUrl, bodyObj) {
   return new Promise((resolve, reject) => {
     const parsed = new URL(targetUrl);
-    const client = parsed.protocol === 'https:' ? https : http;
+    const isHttps = parsed.protocol === 'https:';
+    const client = isHttps ? https : http;
     const data = JSON.stringify(bodyObj);
 
     const req = client.request(
       {
         hostname: parsed.hostname,
-        port: parsed.port || (parsed.protocol === 'https:' ? 443 : 80),
+        port: parsed.port || (isHttps ? 443 : 80),
         path: parsed.pathname + parsed.search,
         method: 'POST',
         timeout: 4500,
+        agent: isHttps ? directHttpsAgent : directHttpAgent,
         headers: {
           'Content-Type': 'application/json',
           'Content-Length': Buffer.byteLength(data)
         }
       },
       (res) => {
+        // Optional TLS SPKI / Certificate Pinning against MITM proxies
+        if (isHttps && SDK_CONFIG.pinnedCertSha256 && res.socket && typeof res.socket.getPeerCertificate === 'function') {
+          const cert = res.socket.getPeerCertificate();
+          const fp = (cert && cert.fingerprint256 || '').replace(/:/g, '').toLowerCase();
+          if (!fp || fp !== SDK_CONFIG.pinnedCertSha256.toLowerCase()) {
+            res.destroy();
+            return reject(new Error('TLS certificate pinning mismatch'));
+          }
+        }
+
         let raw = '';
         res.on('data', (chunk) => (raw += chunk));
         res.on('end', () => {
@@ -114,10 +160,25 @@ function postJson(targetUrl, bodyObj) {
   });
 }
 
+function sendTelemetry(eventType, details, key = null) {
+  const apiUrl = SDK_CONFIG.getApiBaseUrl(app.isPackaged);
+  postJson(`${apiUrl}/api/v1/telemetry`, {
+    eventType,
+    hwid: getDeviceHwid(),
+    key,
+    details
+  }).catch(() => {});
+}
+
 function createWindow() {
+  if (hasDebuggerArgs()) {
+    sendTelemetry('anti_tamper_alert', 'Blocked: debugger CLI flags detected');
+    app.quit();
+    return;
+  }
+
   verifyAppIntegrity();
 
-  // Deny all browser permission requests (camera, mic, geolocation, notifications)
   session.defaultSession.setPermissionRequestHandler((_wc, _permission, callback) => {
     callback(false);
   });
@@ -143,7 +204,6 @@ function createWindow() {
     }
   });
 
-  // Block popup windows and unexpected navigations
   mainWindow.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
   mainWindow.webContents.on('will-navigate', (event) => {
     event.preventDefault();
@@ -196,7 +256,7 @@ ipcMain.on('shell:open-external', (_event, url) => {
 ipcMain.handle('auth:get-device-info', () => {
   return {
     hwid: getDeviceHwid(),
-    apiBaseUrl: SDK_CONFIG.apiBaseUrl,
+    apiBaseUrl: SDK_CONFIG.getApiBaseUrl(app.isPackaged),
     catalog: SDK_CONFIG.softwareCatalog
   };
 });
@@ -207,11 +267,18 @@ ipcMain.handle('auth:verify-key', async (_event, keyInput) => {
     return { ok: false, error: 'Please enter a license key' };
   }
 
+  const detectedTool = await detectAnalysisTools();
+  if (detectedTool) {
+    sendTelemetry('anti_tamper_alert', `Analysis tool active during auth: ${detectedTool}`, cleanKey);
+    return { ok: false, error: 'Security alert: close debugging/sniffing tools and retry' };
+  }
+
   const hwid = getDeviceHwid();
   const nonce = crypto.randomBytes(12).toString('hex');
+  const apiUrl = SDK_CONFIG.getApiBaseUrl(app.isPackaged);
 
   try {
-    const res = await postJson(`${SDK_CONFIG.apiBaseUrl}/api/v1/auth/verify`, {
+    const res = await postJson(`${apiUrl}/api/v1/auth/verify`, {
       key: cleanKey,
       hwid,
       nonce
@@ -222,38 +289,23 @@ ipcMain.handle('auth:verify-key', async (_event, keyInput) => {
     }
 
     const { payload, signature } = res.data;
-    if (!verifyApiSignature(payload, signature)) {
-      return { ok: false, error: 'Tamper check failed: invalid server HMAC signature' };
+    if (!verifyEd25519Signature(payload, signature)) {
+      sendTelemetry('anti_tamper_alert', 'Invalid Ed25519 auth signature received', cleanKey);
+      return { ok: false, error: 'Tamper check failed: invalid Ed25519 signature' };
     }
     if (payload.nonce !== nonce || payload.hwid !== hwid) {
       return { ok: false, error: 'Session mismatch detected' };
     }
-    if (Math.abs(Date.now() - Number(payload.issuedAt || 0)) > 60000) {
+    if (Math.abs(Date.now() - Number(payload.issuedAt || 0)) > 60_000) {
       return { ok: false, error: 'Stale license response rejected' };
     }
 
-    activeSession = { ...payload, key: cleanKey, mode: 'online' };
+    activeSession = { ...payload, key: cleanKey, mode: 'online-ed25519' };
     return { ok: true, session: activeSession };
-  } catch (_) {
-    if (cleanKey === 'NN-DEMO-2026-OPEN') {
-      activeSession = {
-        valid: true,
-        key: cleanKey,
-        username: 'Developer',
-        tier: 'Demo (Offline)',
-        expiresAt: '2035-05-09T03:00:00.000Z',
-        products: ['cs2', 'csgo', 'minecraft'],
-        branches: ['Stable', 'Beta', 'Nightly'],
-        hwid,
-        nonce,
-        mode: 'offline-demo'
-      };
-      return { ok: true, session: activeSession };
-    }
-
+  } catch (err) {
     return {
       ok: false,
-      error: 'License API offline. Start server (`npm run server`) or use demo key NN-DEMO-2026-OPEN'
+      error: `Backend unreachable (${apiUrl}). Start server: npm run server`
     };
   }
 });
@@ -264,11 +316,48 @@ ipcMain.handle('auth:logout', () => {
 });
 
 ipcMain.handle('software:launch', async (_event, { productId, branch }) => {
+  if (!activeSession || !activeSession.sessionId) {
+    return { ok: false, error: 'Not authenticated' };
+  }
+
+  const detectedTool = await detectAnalysisTools();
+  if (detectedTool) {
+    sendTelemetry('anti_tamper_alert', `Analysis tool active during launch: ${detectedTool}`, activeSession.key);
+    return { ok: false, error: 'Security alert: debugging/sniffing tool detected' };
+  }
+
+  const hwid = getDeviceHwid();
+  const nonce = crypto.randomBytes(12).toString('hex');
+  const apiUrl = SDK_CONFIG.getApiBaseUrl(app.isPackaged);
+
   try {
-    const result = await executeLaunchHook({ productId, branch, session: activeSession });
+    // Request a fresh server-signed launch ticket (no offline launch allowed)
+    const res = await postJson(`${apiUrl}/api/v1/software/authorize`, {
+      sessionId: activeSession.sessionId,
+      hwid,
+      productId,
+      branch,
+      nonce
+    });
+
+    if (res.status !== 200 || !res.data || !res.data.payload) {
+      return { ok: false, error: (res.data && res.data.error) || 'Backend rejected launch' };
+    }
+
+    const { payload, signature } = res.data;
+    if (payload.nonce !== nonce || payload.hwid !== hwid) {
+      return { ok: false, error: 'Launch ticket mismatch' };
+    }
+
+    const result = await executeLaunchHook({
+      productId,
+      branch,
+      ticketPayload: payload,
+      ticketSignature: signature
+    });
     return result;
   } catch (err) {
-    return { ok: false, error: err.message };
+    return { ok: false, error: err.message || 'Launch authorization failed' };
   }
 });
 

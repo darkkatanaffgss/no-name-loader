@@ -350,14 +350,14 @@
 
   function openApiDocsModal() {
     openModal(
-      'Open-Source API',
-      'License Verification & SDK Reference',
+      'Backend Architecture',
+      'Ed25519 + SQLite License & Analytics API',
       [
-        '1. Start the bundled license server: npm run server (port 3840).',
-        '2. Issue keys via POST /api/v1/admin/keys with x-admin-secret.',
-        '3. Client sends key + hardware ID + nonce; server returns an HMAC-SHA256 signed session payload.'
+        '1. Run `npm run setup` to generate a unique Ed25519 keypair + ADMIN_SECRET in api-server/.env.',
+        '2. Start the SQLite backend & Admin UI: `npm run server` -> http://127.0.0.1:3840/admin.',
+        '3. Client embeds ONLY the Ed25519 Public Key (zero secrets in EXE). Every login and launch is verified server-side.'
       ],
-      'POST /api/v1/auth/verify\n{ "key": "NN-DEMO-2026-OPEN", "hwid": "...", "nonce": "..." }\n\nSDK Hook -> sdk/loader-sdk.js: executeLaunchHook({ productId, branch, session })'
+      'POST /api/v1/auth/verify -> returns Ed25519-signed session\nPOST /api/v1/software/authorize -> issues 30s signed launch ticket\nGET  /admin -> live analytics & key management'
     );
   }
 

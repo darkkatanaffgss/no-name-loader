@@ -4,6 +4,7 @@
   "description": "Open-source glassmorphic loader UI, License API & SDK template built with Electron.",
   "main": "main.js",
   "scripts": {
+    "setup": "node scripts/setup-keys.js",
     "start": "electron .",
     "server": "node api-server/server.js",
     "build": "node scripts/build.js"

@@ -2,5 +2,7 @@ node_modules/
 dist/
 release*/
 build-stage/
+api-server/.env
+api-server/database.sqlite*
 *.log
 .DS_Store

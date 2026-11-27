@@ -1,0 +1,233 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>no name — Admin & Analytics</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: "Inter", "Segoe UI", sans-serif;
+      background: #090b10;
+      color: #f1f3f7;
+      min-height: 100vh;
+      padding: 28px;
+    }
+    .wrap { max-width: 1080px; margin: 0 auto; display: flex; flex-direction: column; gap: 20px; }
+    .head {
+      display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px;
+      padding: 18px 22px; border-radius: 16px; background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.08);
+    }
+    .brand { display: flex; align-items: center; gap: 12px; }
+    .badge {
+      width: 34px; height: 34px; border-radius: 9px; background: #181c26; border: 1px solid rgba(255,255,255,0.1);
+      display: flex; align-items: center; justify-content: center; font-weight: 700; font-size: 13px;
+    }
+    .auth-row { display: flex; gap: 8px; }
+    input, select {
+      height: 36px; padding: 0 12px; border-radius: 9px; border: 1px solid rgba(255,255,255,0.1);
+      background: #0d1017; color: #fff; font-family: inherit; font-size: 13px; outline: none;
+    }
+    input:focus, select:focus { border-color: #4683eb; }
+    button {
+      height: 36px; padding: 0 14px; border-radius: 9px; border: 1px solid rgba(255,255,255,0.1);
+      background: rgba(255,255,255,0.07); color: #fff; font-family: inherit; font-size: 12.5px; font-weight: 500; cursor: pointer;
+    }
+    button.primary { background: #4683eb; border-color: rgba(114,166,255,0.4); }
+    button.danger { background: rgba(239,68,68,0.16); border-color: rgba(239,68,68,0.35); color: #fca5a5; }
+    button:hover { opacity: 0.92; }
+    .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; }
+    .stat-card, .panel {
+      padding: 16px 18px; border-radius: 14px; background: rgba(255,255,255,0.025); border: 1px solid rgba(255,255,255,0.07);
+    }
+    .stat-label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: #7c8494; margin-bottom: 6px; }
+    .stat-val { font-size: 24px; font-weight: 700; }
+    .panel h2 { font-size: 14px; margin-bottom: 14px; }
+    .form-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 10px; margin-bottom: 12px; }
+    .checks { display: flex; gap: 14px; flex-wrap: wrap; align-items: center; margin-bottom: 12px; font-size: 12.5px; color: #b4bac6; }
+    .checks label { display: flex; align-items: center; gap: 6px; cursor: pointer; }
+    .checks input { width: auto; height: auto; }
+    table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+    th, td { text-align: left; padding: 10px 8px; border-bottom: 1px solid rgba(255,255,255,0.06); }
+    th { color: #7c8494; font-weight: 600; font-size: 11px; text-transform: uppercase; }
+    code { font-family: Consolas, monospace; background: rgba(255,255,255,0.06); padding: 2px 6px; border-radius: 5px; }
+    .pill { padding: 2px 8px; border-radius: 999px; font-size: 11px; background: rgba(70,131,235,0.18); color: #93c5fd; }
+    .pill.red { background: rgba(239,68,68,0.18); color: #fca5a5; }
+    .pill.green { background: rgba(34,197,94,0.18); color: #86efac; }
+    .actions { display: flex; gap: 6px; flex-wrap: wrap; }
+    .actions button { height: 28px; padding: 0 9px; font-size: 11px; border-radius: 7px; }
+    .hidden { display: none; }
+    .err { color: #f87171; font-size: 12px; margin-top: 6px; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="head">
+      <div class="brand">
+        <div class="badge">NN</div>
+        <div>
+          <div style="font-weight:600;font-size:15px;">no name — Admin & Analytics</div>
+          <div style="font-size:12px;color:#7c8494;">SQLite + Ed25519 License Management</div>
+        </div>
+      </div>
+      <div class="auth-row">
+        <input type="password" id="adminSecret" placeholder="Paste ADMIN_SECRET from api-server/.env" style="width:290px;" />
+        <button class="primary" id="connectBtn">Connect</button>
+      </div>
+    </div>
+    <div id="errBox" class="err"></div>
+
+    <div id="dashboard" class="hidden" style="display:flex;flex-direction:column;gap:18px;">
+      <div class="stats-grid">
+        <div class="stat-card"><div class="stat-label">Total Keys</div><div class="stat-val" id="sTotal">0</div></div>
+        <div class="stat-card"><div class="stat-label">Active Keys</div><div class="stat-val" id="sActive">0</div></div>
+        <div class="stat-card"><div class="stat-label">Active Sessions</div><div class="stat-val" id="sSessions">0</div></div>
+        <div class="stat-card"><div class="stat-label">Total Launches</div><div class="stat-val" id="sLaunches">0</div></div>
+        <div class="stat-card"><div class="stat-label">Security Alerts</div><div class="stat-val" id="sAlerts" style="color:#f87171;">0</div></div>
+      </div>
+
+      <div class="panel">
+        <h2>Issue New License Key</h2>
+        <div class="form-grid">
+          <input type="text" id="newUser" placeholder="Username (e.g. Player1)" />
+          <select id="newTier">
+            <option value="Pro">Pro</option>
+            <option value="Enterprise">Enterprise</option>
+            <option value="Standard">Standard</option>
+          </select>
+          <select id="newDays">
+            <option value="7">7 Days</option>
+            <option value="30" selected>30 Days</option>
+            <option value="90">90 Days</option>
+            <option value="lifetime">Lifetime</option>
+          </select>
+        </div>
+        <div class="checks">
+          <span>Products:</span>
+          <label><input type="checkbox" class="prod-chk" value="cs2" checked /> CS2</label>
+          <label><input type="checkbox" class="prod-chk" value="csgo" checked /> CS:GO</label>
+          <label><input type="checkbox" class="prod-chk" value="minecraft" checked /> Minecraft</label>
+          <span style="margin-left:12px;">Branches:</span>
+          <label><input type="checkbox" class="br-chk" value="Stable" checked /> Stable</label>
+          <label><input type="checkbox" class="br-chk" value="Beta" checked /> Beta</label>
+          <label><input type="checkbox" class="br-chk" value="Nightly" checked /> Nightly</label>
+        </div>
+        <button class="primary" id="createKeyBtn">Generate Key</button>
+      </div>
+
+      <div class="panel">
+        <h2>Licenses</h2>
+        <table>
+          <thead>
+            <tr>
+              <th>Key</th><th>User</th><th>Tier</th><th>HWID</th><th>Launches</th><th>Status</th><th>Actions</th>
+            </tr>
+          </thead>
+          <tbody id="licensesBody"></tbody>
+        </table>
+      </div>
+
+      <div class="panel">
+        <h2>Live Security & Launch Analytics</h2>
+        <table>
+          <thead>
+            <tr><th>Time</th><th>Event</th><th>Key</th><th>Product / Branch</th><th>Details</th></tr>
+          </thead>
+          <tbody id="eventsBody"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const secretInput = document.getElementById('adminSecret');
+    const dashboard = document.getElementById('dashboard');
+    const errBox = document.getElementById('errBox');
+    dashboard.style.display = 'none';
+
+    async function api(path, method = 'GET', body = null) {
+      const res = await fetch(path, {
+        method,
+        headers: {
+          'Content-Type': 'application/json',
+          'x-admin-secret': secretInput.value.trim()
+        },
+        body: body ? JSON.stringify(body) : null
+      });
+      return res.json();
+    }
+
+    async function refresh() {
+      errBox.textContent = '';
+      const data = await api('/api/v1/admin/analytics');
+      if (!data.ok) {
+        dashboard.style.display = 'none';
+        errBox.textContent = data.error || 'Authentication failed';
+        return;
+      }
+      dashboard.style.display = 'flex';
+      document.getElementById('sTotal').textContent = data.stats.totalLicenses;
+      document.getElementById('sActive').textContent = data.stats.activeLicenses;
+      document.getElementById('sSessions').textContent = data.stats.activeSessions;
+      document.getElementById('sLaunches').textContent = data.stats.totalLaunches;
+      document.getElementById('sAlerts').textContent = data.stats.securityAlerts;
+
+      const lBody = document.getElementById('licensesBody');
+      lBody.innerHTML = '';
+      for (const lic of data.licenses) {
+        const tr = document.createElement('tr');
+        tr.innerHTML = `
+          <td><code>${lic.key}</code></td>
+          <td>${lic.username}</td>
+          <td>${lic.tier}</td>
+          <td><code>${lic.hwid ? lic.hwid.slice(0, 10) + '…' : 'Unbound'}</code></td>
+          <td>${lic.launchCount}</td>
+          <td><span class="pill ${lic.revoked ? 'red' : 'green'}">${lic.revoked ? 'Revoked' : 'Active'}</span></td>
+          <td class="actions">
+            <button onclick="navigator.clipboard.writeText('${lic.key}')">Copy</button>
+            <button onclick="keyAction('reset-hwid', '${lic.key}')">Reset HWID</button>
+            <button onclick="keyAction('${lic.revoked ? 'unrevoke' : 'revoke'}', '${lic.key}')">${lic.revoked ? 'Restore' : 'Revoke'}</button>
+            <button class="danger" onclick="keyAction('delete', '${lic.key}')">Delete</button>
+          </td>
+        `;
+        lBody.appendChild(tr);
+      }
+
+      const eBody = document.getElementById('eventsBody');
+      eBody.innerHTML = '';
+      for (const ev of data.recentEvents) {
+        const isAlert = ['anti_tamper_alert', 'hwid_mismatch', 'replay_detected'].includes(ev.event_type);
+        const tr = document.createElement('tr');
+        tr.innerHTML = `
+          <td>${new Date(ev.created_at).toLocaleTimeString()}</td>
+          <td><span class="pill ${isAlert ? 'red' : ''}">${ev.event_type}</span></td>
+          <td><code>${ev.license_key || '—'}</code></td>
+          <td>${ev.product_id ? ev.product_id + ' / ' + (ev.branch || '') : '—'}</td>
+          <td>${ev.details || ''}</td>
+        `;
+        eBody.appendChild(tr);
+      }
+    }
+
+    window.keyAction = async function(action, key) {
+      await api('/api/v1/admin/keys', 'POST', { action, key });
+      refresh();
+    };
+
+    document.getElementById('connectBtn').addEventListener('click', refresh);
+    document.getElementById('createKeyBtn').addEventListener('click', async () => {
+      const products = [...document.querySelectorAll('.prod-chk:checked')].map(c => c.value);
+      const branches = [...document.querySelectorAll('.br-chk:checked')].map(c => c.value);
+      await api('/api/v1/admin/keys', 'POST', {
+        action: 'create',
+        username: document.getElementById('newUser').value || 'Customer',
+        tier: document.getElementById('newTier').value,
+        days: document.getElementById('newDays').value,
+        products,
+        branches
+      });
+      refresh();
+    });
+  </script>
+</body>
+</html>

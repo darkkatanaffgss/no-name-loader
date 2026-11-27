@@ -3,6 +3,7 @@ const path = require('path');
 const crypto = require('crypto');
 const { execSync } = require('child_process');
 const JavaScriptObfuscator = require('javascript-obfuscator');
+const { runSetup } = require('./setup-keys');
 
 function copyDirRecursive(src, dst) {
   fs.mkdirSync(dst, { recursive: true });
@@ -42,6 +43,9 @@ async function build() {
   console.log('  no name — Hardened Single-File EXE Builder');
   console.log('================================================\n');
 
+  // Ensure Ed25519 Public Key exists before packaging
+  runSetup({ force: false });
+
   console.log('[1/5] Checking assets and core files...');
   const required = [
     'assets/icon.ico',
@@ -53,6 +57,7 @@ async function build() {
     'assets/banner-csgo.jpg',
     'assets/banner-minecraft.jpg',
     'sdk/loader-sdk.js',
+    'sdk/public-config.json',
     'main.js',
     'preload.js',
     'index.html',
@@ -72,7 +77,7 @@ async function build() {
   }
   fs.mkdirSync(stageDir, { recursive: true });
 
-  // Copy app files into build-stage (keeps original repo source clean and readable)
+  // Copy ONLY client files into build-stage (api-server/ and .env are NEVER bundled in the EXE!)
   for (const file of ['package.json', 'main.js', 'preload.js', 'index.html', 'styles.css', 'renderer.js']) {
     fs.copyFileSync(path.join(rootDir, file), path.join(stageDir, file));
   }
@@ -84,8 +89,8 @@ async function build() {
     obfuscateFile(path.join(stageDir, jsFile));
   }
 
-  // Generate SHA-256 runtime integrity manifest over staged files
-  const integrityTargets = ['index.html', 'styles.css', 'renderer.js', 'preload.js', 'sdk/loader-sdk.js'];
+  // Generate SHA-256 runtime integrity manifest over staged client files
+  const integrityTargets = ['index.html', 'styles.css', 'renderer.js', 'preload.js', 'sdk/loader-sdk.js', 'sdk/public-config.json'];
   const manifest = {};
   for (const rel of integrityTargets) {
     manifest[rel] = crypto
